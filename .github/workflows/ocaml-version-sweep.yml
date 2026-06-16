@@ -1,0 +1,120 @@
+name: OCaml version sweep
+
+# Attempts to compile girard.ml (Leo White's encoding of Girard's paradox in the OCaml
+# module system) under many OCaml versions on x86-64 Ubuntu, recording for each version
+# whether the compiler itself builds on the runner, whether ocamlc accepts girard.ml
+# within a bounded time, or whether it does not finish. The point is a public, reproducible
+# record of which OCaml versions can typecheck the paradox, and roughly how long it takes,
+# on the x86-64 architecture (where, unlike Apple Silicon, pre-4.14 compilers are available).
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Bound per compile. girard.ml typechecks pathologically slowly on recent compilers
+  # (observed: did not finish in 20 min even on a fast arm64 machine for 4.14 and 5.x),
+  # so this only needs to be generous enough to catch a version that DOES finish.
+  COMPILE_TIMEOUT: "45m"
+
+jobs:
+  compile:
+    name: ocaml ${{ matrix.ocaml }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        ocaml:
+          - "4.02.3"
+          - "4.05.0"
+          - "4.08.1"
+          - "4.11.2"
+          - "4.14.2"
+          - "5.0.0"
+          - "5.1.1"
+          - "5.2.1"
+          - "5.3.0"
+          - "5.4.1"
+    steps:
+      - uses: actions/checkout@v6.0.3
+
+      - name: Install opam
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y opam
+          opam init --bare --disable-sandboxing -y
+
+      - name: Build the compiler and compile girard.ml (bounded; never fatal)
+        env:
+          # matrix.ocaml is a fixed, trusted version list, but pass it via env (not inline
+          # ${{ }} in the script) per GitHub Actions injection-safety guidance.
+          V: ${{ matrix.ocaml }}
+        run: |
+          set -u
+          mkdir -p results
+          # Build the requested compiler. A build failure on this runner's toolchain is
+          # recorded as data (it does NOT mean girard.ml would or would not compile).
+          if ! opam switch create sweep "ocaml-base-compiler.${V}" -y > build.log 2>&1; then
+            echo "| \`${V}\` | compiler build FAILED on runner toolchain | n/a |" > "results/${V}.md"
+            echo "::warning::compiler build failed for ${V}"
+            echo "---- build.log (tail) ----"; tail -n 30 build.log || true
+            exit 0
+          fi
+          OCAMLC_VER="$(opam exec --switch sweep -- ocamlc -version 2>/dev/null || echo unknown)"
+          start=$(date +%s)
+          if timeout "${COMPILE_TIMEOUT}" opam exec --switch sweep -- ocamlc -c girard.ml > compile.log 2>&1; then
+            secs=$(( $(date +%s) - start ))
+            echo "| \`${V}\` | COMPILED (ocamlc ${OCAMLC_VER}) | ${secs}s |" > "results/${V}.md"
+          else
+            rc=$?
+            secs=$(( $(date +%s) - start ))
+            if [ "${rc}" -eq 124 ]; then
+              echo "| \`${V}\` | did NOT finish in ${COMPILE_TIMEOUT} | >${secs}s |" > "results/${V}.md"
+            else
+              echo "| \`${V}\` | compile ERROR (exit ${rc}) | ${secs}s |" > "results/${V}.md"
+              echo "---- compile.log (tail) ----"; tail -n 30 compile.log || true
+            fi
+          fi
+          echo "Row: $(cat "results/${V}.md")"
+          cat "results/${V}.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result row
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: result-${{ matrix.ocaml }}
+          path: results/*.md
+          if-no-files-found: warn
+
+  summary:
+    name: Aggregate results
+    needs: compile
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all result rows
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: results
+      - name: Build summary table
+        run: |
+          set -u
+          {
+            echo "# girard.ml compile sweep across OCaml versions"
+            echo ""
+            echo "Host: GitHub-hosted \`ubuntu-latest\` (x86-64). Per-compile timeout: \`${COMPILE_TIMEOUT}\`."
+            echo "girard.ml is Leo White's Girard's-paradox encoding (this repo, forked from lpw25/girards-paradox)."
+            echo ""
+            echo "| OCaml | result | time |"
+            echo "|---|---|---|"
+            cat results/*.md 2>/dev/null | sort -V
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "----- assembled table -----"
+          cat results/*.md 2>/dev/null | sort -V || echo "(no rows)"
