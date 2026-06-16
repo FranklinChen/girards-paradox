@@ -9,6 +9,8 @@ name: OCaml version sweep
 
 on:
   push:
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 permissions:
